@@ -1,13 +1,14 @@
 """
-Gold (XAU/USD) 5-minute scalping signal bot — active market read version
-Sends a directional call every 5-min candle based on trend + RSI momentum,
-plus supports /signal for on-demand check anytime via Telegram.
+Gold (XAU/USD) 5-minute scalping signal bot
+Runs as a Web Service (free tier) with a keep-alive endpoint.
 """
 
 import time
+import threading
 import requests
 import pandas as pd
 from datetime import datetime, timezone
+from flask import Flask
 
 # ============ CONFIG ============
 TWELVEDATA_API_KEY = "400531b0f15a4c98a2b0401ab23a8d86"
@@ -32,6 +33,12 @@ TELEGRAM_UPDATES_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpd
 
 last_sent_candle_time = None
 last_update_id = None
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Gold scalper bot is running."
 
 
 def fetch_candles(outputsize=100):
@@ -141,9 +148,9 @@ def check_for_commands():
                 send_message(f"Error: {e}")
 
 
-def main_loop():
+def bot_loop():
     global last_sent_candle_time
-    print("Gold scalper bot started (active mode)...")
+    print("Gold scalper bot started...")
     while True:
         try:
             check_for_commands()
@@ -162,4 +169,7 @@ def main_loop():
 
 
 if __name__ == "__main__":
-    main_loop()
+    threading.Thread(target=bot_loop, daemon=True).start()
+    import os
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
