@@ -1,12 +1,10 @@
 """
-Gold (XAU/USD) 5-minute SMC scalping bot
-------------------------------------------
-Detects: liquidity sweeps + fair value gaps (FVG), filtered by EMA trend.
-Sends signals to Telegram with inline buttons (Taken / Skip / Details).
+Gold (XAU/USD) 5-minute SMC scalping bot — with Telegram dashboard
 """
 
 import time
 import threading
+import json
 import requests
 import pandas as pd
 from datetime import datetime, timezone
@@ -32,6 +30,9 @@ TG_UPDATES = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
 
 last_sent_candle_time = None
 last_update_id = None
+last_call = None
+
+stats = {"sent": 0, "buy": 0, "sell": 0, "wait": 0, "taken": 0, "skipped": 0}
 
 app = Flask(__name__)
 
@@ -75,11 +76,9 @@ def find_swing_levels(df, lookback):
 
 def detect_liquidity_sweep(df, swing_high, swing_low):
     curr = df.iloc[-1]
-    swept_high = curr["high"] > swing_high and curr["close"] < swing_high
-    swept_low = curr["low"] < swing_low and curr["close"] > swing_low
-    if swept_low:
+    if curr["low"] < swing_low and curr["close"] > swing_low:
         return "bullish"
-    if swept_high:
+    if curr["high"] > swing_high and curr["close"] < swing_high:
         return "bearish"
     return None
 
@@ -87,7 +86,7 @@ def detect_liquidity_sweep(df, swing_high, swing_low):
 def detect_fvg(df):
     if len(df) < 4:
         return None
-    c1, c2, c3 = df.iloc[-4], df.iloc[-3], df.iloc[-2]
+    c1, c3 = df.iloc[-4], df.iloc[-2]
     if c3["low"] > c1["high"]:
         return "bullish"
     if c3["high"] < c1["low"]:
@@ -104,8 +103,7 @@ def get_call(df):
     sweep = detect_liquidity_sweep(df, swing_high, swing_low)
     fvg = detect_fvg(df)
 
-    direction = "WAIT"
-    sl = tp = None
+    direction, sl, tp = "WAIT", None, None
     reason = "No sweep + FVG alignment this candle."
 
     if sweep == "bullish" and fvg == "bullish" and trend_up:
@@ -150,26 +148,108 @@ def format_call(call):
     )
 
 
-def build_keyboard():
-    return {
-        "inline_keyboard": [[
-            {"text": "✅ Taken", "callback_data": "taken"},
-            {"text": "⏭ Skip", "callback_data": "skip"},
-            {"text": "📊 Details", "callback_data": "details"},
-        ]]
-    }
+def signal_keyboard():
+    return {"inline_keyboard": [[
+        {"text": "✅ Taken", "callback_data": "taken"},
+        {"text": "⏭ Skip", "callback_data": "skip"},
+        {"text": "📊 Details", "callback_data": "details"},
+    ]]}
 
 
-def send_message(text, with_buttons=False):
+def menu_keyboard():
+    return {"inline_keyboard": [
+        [{"text": "📈 Last Signal", "callback_data": "menu_last"},
+         {"text": "📊 Status", "callback_data": "menu_status"}],
+        [{"text": "📉 Stats", "callback_data": "menu_stats"},
+         {"text": "❓ Help", "callback_data": "menu_help"}],
+    ]}
+
+
+def dashboard_text():
+    return (
+        "🏆 *Gold Scalper — SMC Dashboard*\n\n"
+        "Strategy: liquidity sweep + fair value gap, filtered by EMA trend.\n"
+        "Timeframe: XAU/USD 5m\n\n"
+        "Choose an option below:"
+    )
+
+
+def send_message(text, keyboard=None):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    if with_buttons:
-        import json
-        payload["reply_markup"] = json.dumps(build_keyboard())
+    if keyboard:
+        payload["reply_markup"] = json.dumps(keyboard)
     requests.post(TG_SEND, data=payload, timeout=15)
 
 
 def answer_callback(callback_id, text):
     requests.post(TG_ANSWER, data={"callback_query_id": callback_id, "text": text}, timeout=15)
+
+
+def set_bot_commands():
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands"
+    commands = [
+        {"command": "menu", "description": "Open the dashboard"},
+        {"command": "signal", "description": "Check for a signal now"},
+        {"command": "stats", "description": "View session stats"},
+        {"command": "help", "description": "How this bot works"},
+    ]
+    requests.post(url, data={"commands": json.dumps(commands)}, timeout=15)
+
+
+def handle_signal_request():
+    global last_call
+    try:
+        df = compute_indicators(fetch_candles())
+        call = get_call(df)
+        last_call = call
+        stats["sent"] += 1
+        stats[call["direction"].lower()] += 1
+        kb = signal_keyboard() if call["direction"] != "WAIT" else None
+        send_message(format_call(call), keyboard=kb)
+    except Exception as e:
+        send_message(f"Error: {e}")
+
+
+def stats_text():
+    return (
+        "📉 *Session Stats*\n\n"
+        f"Total signals: {stats['sent']}\n"
+        f"BUY: {stats['buy']} | SELL: {stats['sell']} | WAIT: {stats['wait']}\n"
+        f"Marked Taken: {stats['taken']} | Skipped: {stats['skipped']}"
+    )
+
+
+def help_text():
+    return (
+        "❓ *How this works*\n\n"
+        "Strategy looks for a liquidity sweep (stop-hunt past a recent "
+        "swing high/low) lining up with a fair value gap, filtered by "
+        "EMA trend direction. Signals are intentionally rare — quality "
+        "over quantity.\n\n"
+        "Commands: /menu /signal /stats /help"
+    )
+
+
+def handle_menu_callback(action, callback_id):
+    if action == "menu_last":
+        if last_call:
+            answer_callback(callback_id, "Showing last signal")
+            send_message(format_call(last_call))
+        else:
+            answer_callback(callback_id, "No signal computed yet")
+    elif action == "menu_status":
+        answer_callback(callback_id, "Status")
+        send_message(
+            "📊 *Bot Status*\n\nRunning: ✅\n"
+            f"Signals sent this session: {stats['sent']}\n"
+            f"Poll interval: {POLL_SECONDS}s"
+        )
+    elif action == "menu_stats":
+        answer_callback(callback_id, "Stats")
+        send_message(stats_text())
+    elif action == "menu_help":
+        answer_callback(callback_id, "Help")
+        send_message(help_text())
 
 
 def check_for_commands():
@@ -181,42 +261,58 @@ def check_for_commands():
     data = r.json()
     if not data.get("ok"):
         return
+
     for update in data.get("result", []):
         last_update_id = update["update_id"]
+
         if "callback_query" in update:
             cq = update["callback_query"]
             action = cq.get("data")
-            responses = {
-                "taken": "Logged as taken ✅ — track it and check back later.",
-                "skip": "Skipped ⏭",
-                "details": "This signal used a liquidity sweep + FVG on 5m gold, filtered by EMA trend.",
-            }
-            answer_callback(cq["id"], responses.get(action, "OK"))
+            if action in ("menu_last", "menu_status", "menu_stats", "menu_help"):
+                handle_menu_callback(action, cq["id"])
+            elif action == "taken":
+                stats["taken"] += 1
+                answer_callback(cq["id"], "Logged as taken ✅")
+            elif action == "skip":
+                stats["skipped"] += 1
+                answer_callback(cq["id"], "Skipped ⏭")
+            elif action == "details":
+                answer_callback(cq["id"], "Sweep + FVG + EMA trend alignment — see /help")
             continue
+
         text = update.get("message", {}).get("text", "").strip().lower()
-        if text == "/signal":
-            try:
-                df = compute_indicators(fetch_candles())
-                call = get_call(df)
-                send_message(format_call(call), with_buttons=(call["direction"] != "WAIT"))
-            except Exception as e:
-                send_message(f"Error: {e}")
+        if text in ("/start", "/menu"):
+            send_message(dashboard_text(), keyboard=menu_keyboard())
+        elif text == "/signal":
+            handle_signal_request()
+        elif text == "/stats":
+            send_message(stats_text())
+        elif text == "/help":
+            send_message(help_text())
 
 
 def bot_loop():
-    global last_sent_candle_time
+    global last_sent_candle_time, last_call
     print("SMC gold scalper bot started...", flush=True)
+    set_bot_commands()
     while True:
         try:
             check_for_commands()
             df = compute_indicators(fetch_candles())
             call = get_call(df)
+            last_call = call
+
             if call["time"] != last_sent_candle_time:
-                send_message(format_call(call), with_buttons=(call["direction"] != "WAIT"))
+                stats["sent"] += 1
+                stats[call["direction"].lower()] += 1
+                kb = signal_keyboard() if call["direction"] != "WAIT" else None
+                send_message(format_call(call), keyboard=kb)
                 last_sent_candle_time = call["time"]
                 print(f"[{datetime.now(timezone.utc)}] Sent {call['direction']}", flush=True)
+
         except Exception as e:
             print(f"Error: {e}", flush=True)
+
         time.sleep(POLL_SECONDS)
 
 
